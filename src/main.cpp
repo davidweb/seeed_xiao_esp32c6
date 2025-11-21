@@ -4,7 +4,7 @@
 #include <WiFi.h>
 #include <WebServer.h>
 
-// --- CONFIGURATION LORA & SYSTÈME ---
+// --- CONFIGURATION LORA ---
 #define DEVICE_ID           0x77 
 #define LORA_FREQUENCY      433E6
 #define LORA_SF             12
@@ -19,7 +19,7 @@
 #define ACK_RELAY_IS_ON     0xD4
 #define ACK_RELAY_IS_OFF    0xE5
 
-// --- PINOUT XIAO ESP32C6 ---
+// --- PINOUT XIAO ESP32C6 (Headers Latéraux) ---
 #define PIN_LORA_RST    D0
 #define PIN_LORA_NSS    D1
 #define PIN_LORA_DIO0   D2
@@ -28,7 +28,7 @@
 #define PIN_LORA_MISO   D5
 #define PIN_LORA_SCK    D6
 #define PIN_LED         LED_BUILTIN
-#define PIN_BATTERY     A0 // Nécessite pont diviseur hardware
+#define PIN_BATTERY     A0 
 
 // --- VARIABLES ---
 WebServer server(80);
@@ -57,18 +57,15 @@ void goToDeepSleep() {
     esp_deep_sleep_start();
 }
 
-String getBattery() {
-    // Retourne une estimation si diviseur de tension présent, sinon N/A
-    // uint32_t raw = analogReadMilliVolts(PIN_BATTERY);
-    // float v = (raw * 2.0) / 1000.0;
-    // return String(v, 2) + "V";
-    return "Non Cable";
-}
+String getBattery() { return "Non Cable"; }
 
 void initLoRa() {
+    // IMPORTANT : On force les pins SPI latérales ici
     SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
     LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
+    
     if (!LoRa.begin(LORA_FREQUENCY)) { ledSignal(10, 50); goToDeepSleep(); }
+    
     LoRa.setSpreadingFactor(LORA_SF); LoRa.setSignalBandwidth(LORA_BW);
     LoRa.setCodingRate4(LORA_CR); LoRa.setSyncWord(LORA_SYNC_WORD); LoRa.setTxPower(LORA_TX_POWER);
 }
@@ -93,9 +90,13 @@ bool sendCmd(uint8_t cmd) {
 void setup() {
     pinMode(PIN_LED, OUTPUT); digitalWrite(PIN_LED, HIGH);
     pinMode(PIN_BUTTON, INPUT_PULLUP);
+    
+    // Le Serial peut mettre du temps à monter sur le C6
+    Serial.begin(115200);
+    
     unsigned long start = millis();
 
-    // MODE MAINTENANCE WIFI (Appui long > 5s)
+    // MODE MAINTENANCE WIFI (Appui > 5s)
     while(digitalRead(PIN_BUTTON) == LOW) {
         if(millis() - start > 5000) {
             ledSignal(1, 1000); initLoRa();
