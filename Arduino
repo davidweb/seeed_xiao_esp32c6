@@ -1,7 +1,7 @@
 /*
- * PROJET : REMOTE LORA - HYBRIDE WIFI/PHYSIQUE
+ * PROJET : REMOTE LORA - V2.0 INDUSTRIEL (SECURISE + RSSI)
  * CIBLE  : Seeed Studio XIAO ESP32C6
- * VERSION: 7.0 (Contrôle total bouton dans le mode WiFi + Sortie manuelle)
+ * AUTEUR : Assistant IA
  */
 
 #include <Arduino.h>
@@ -10,17 +10,22 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include "driver/gpio.h"
+#include <Preferences.h> // Pour sauvegarde Rolling Code
 
-// --- CONFIGURATION LORA ---
+// ==========================================
+// --- CONFIGURATION ---
+// ==========================================
 #define DEVICE_ID           0x77 
 #define LORA_FREQUENCY      433E6
+
+// REGLAGES 2.5KM - 5KM (Ra-02)
 #define LORA_SF             11     
 #define LORA_BW             125E3  
 #define LORA_CR             5      
-#define LORA_TX_POWER       17     // 17dBm (Compromis Portée/Batterie)
+#define LORA_TX_POWER       17     // 17dBm (Optimal Batterie/Portée)
 #define LORA_SYNC_WORD      0xF3
 
-// PROTOCOLE
+// COMMANDES
 #define CMD_RELAY_ON        0xA1
 #define CMD_RELAY_OFF       0xB2
 #define ACK_RELAY_IS_ON     0xD4
@@ -36,32 +41,38 @@
 #define PIN_LORA_SCK    D6
 
 // LEDS
-#define PIN_LED_BLUE    D8   // WiFi / Tx
-#define PIN_LED_RED     D9   // Erreur
-#define PIN_LED_GREEN   D10  // Succès
+#define PIN_LED_BLUE    D8
+#define PIN_LED_RED     D9
+#define PIN_LED_GREEN   D10
 
 // TIMINGS
-#define FEEDBACK_DURATION   3000  // Réduit à 3s en mode WiFi pour fluidité
-#define WIFI_TIMEOUT_MS     300000 // 5 min inactivité
+#define FEEDBACK_DURATION   3000 
+#define WIFI_TIMEOUT_MS     300000 
 
 WebServer server(80);
+Preferences preferences; // Mémoire Flash
 volatile unsigned long lastActivityTime = 0;
-String webStatus = "EN ATTENTE...";
 
-// MEMOIRE PERSISTANTE
-RTC_DATA_ATTR bool nextActionIsOn = true; 
-RTC_DATA_ATTR int bootCount = 0; 
+// VARIABLES D'ETAT
+String webStatus = "INITIALISATION...";
+String lastRssiVal = "N/A"; // Pour affichage Web
+RTC_DATA_ATTR bool nextActionIsOn = true; // Mémoire Toggle Rapide
+uint32_t rollingCode = 0; // Compteur Sécurité
 
 const char index_html[] PROGMEM = R"rawliteral(
-<!DOCTYPE HTML><html><head><title>Remote Control</title>
+<!DOCTYPE HTML><html><head><title>Remote V2</title>
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <meta http-equiv="refresh" content="5">
-<style>body{font-family:sans-serif;background:#121212;color:#eee;text-align:center;padding:20px}
-.btn{width:100%;padding:20px;margin:10px 0;font-size:20px;border:none;border-radius:5px;color:#fff;cursor:pointer}
-.on{background:#27ae60}.off{background:#c0392b}.ref{background:#2980b9}</style>
-</head><body><h1>CONTROLE TERRAIN</h1><p>Etat: <b>%STATUS%</b></p>
+<style>body{font-family:sans-serif;background:#1e1e1e;color:#eee;text-align:center;padding:20px}
+.btn{width:100%;padding:20px;margin:10px 0;font-size:20px;border:none;border-radius:8px;color:#fff;cursor:pointer;font-weight:bold;}
+.on{background:#27ae60}.off{background:#c0392b}.ref{background:#2980b9}
+.inf{font-size:14px;color:#aaa;margin-top:20px;}</style>
+</head><body><h1>CONTROLE TERRAIN</h1>
+<p>ETAT: <b style="font-size:24px">%STATUS%</b></p>
 <a href="/on"><button class="btn on">ALLUMER</button></a><a href="/off"><button class="btn off">ETEINDRE</button></a>
-<a href="/status"><button class="btn ref">ACTUALISER</button></a></body></html>)rawliteral";
+<a href="/status"><button class="btn ref">ACTUALISER</button></a>
+<div class="inf">Signal Retour: <b>%RSSI%</b><br>Securite: RollingCode #%CODE%</div>
+</body></html>)rawliteral";
 
 // --- UTILITAIRES ---
 void ledsOff() {
@@ -74,6 +85,7 @@ void initLoRa() {
     SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
     LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
     if (!LoRa.begin(LORA_FREQUENCY)) return;
+    
     LoRa.setSpreadingFactor(LORA_SF);
     LoRa.setSignalBandwidth(LORA_BW);
     LoRa.setCodingRate4(LORA_CR);
@@ -81,206 +93,193 @@ void initLoRa() {
     LoRa.setTxPower(LORA_TX_POWER);
 }
 
-// --- ENVOI COMMANDE LORA ---
+// --- CHARGEMENT COMPTEUR SECURITE ---
+void loadRollingCode() {
+    preferences.begin("remotecode", false);
+    rollingCode = preferences.getUInt("counter", 1);
+    preferences.end();
+}
+
+void incrementAndSaveCode() {
+    rollingCode++;
+    preferences.begin("remotecode", false);
+    preferences.putUInt("counter", rollingCode);
+    preferences.end();
+}
+
+// --- ENVOI SECURISE ---
+// Paquet : [ID, CMD, CODE_Byte1, CODE_Byte2, CODE_Byte3, CODE_Byte4]
 int sendCmd(uint8_t cmd) {
-    // Flash Bleu rapide TX
-    digitalWrite(PIN_LED_BLUE, HIGH); delay(50); digitalWrite(PIN_LED_BLUE, LOW);
+    // 1. Préparation Flash Bleu
+    digitalWrite(PIN_LED_BLUE, HIGH); delay(30); digitalWrite(PIN_LED_BLUE, LOW);
     
+    // 2. Incrémenter Sécurité
+    incrementAndSaveCode();
+    
+    // 3. Tentatives
     for(int attempt = 1; attempt <= 3; attempt++) {
-        LoRa.beginPacket(); LoRa.write(DEVICE_ID); LoRa.write(cmd); LoRa.endPacket();
         
+        LoRa.beginPacket(); 
+        LoRa.write(DEVICE_ID); 
+        LoRa.write(cmd);
+        // Injection du Rolling Code (32 bits split en 4 octets)
+        LoRa.write((rollingCode >> 24) & 0xFF);
+        LoRa.write((rollingCode >> 16) & 0xFF);
+        LoRa.write((rollingCode >> 8) & 0xFF);
+        LoRa.write(rollingCode & 0xFF);
+        LoRa.endPacket();
+        
+        // Attente ACK (2000ms)
         unsigned long s = millis();
-        while(millis() - s < 2000) { // 2s Timeout
+        while(millis() - s < 2000) {
             if(LoRa.parsePacket()) {
-                if(LoRa.available() >= 2) {
-                    uint8_t id = LoRa.read(); uint8_t r = LoRa.read();
+                // ACK Attendu : [ID, STATUS, RSSI]
+                if(LoRa.available() >= 3) {
+                    uint8_t id = LoRa.read(); 
+                    uint8_t r = LoRa.read();
+                    int8_t rssi = (int8_t)LoRa.read(); // Lecture RSSI retourné par Actionneur
+                    
                     if(id == DEVICE_ID) {
+                        // Mise à jour info RSSI pour Web
+                        lastRssiVal = String(rssi) + " dBm";
+                        
                         if(r == ACK_RELAY_IS_ON) return 1;
                         if(r == ACK_RELAY_IS_OFF) return 2;
                     }
                 }
             }
         }
-        delay(100); 
+        delay(100); // Pause retry
     }
     return 0; 
 }
 
-// --- EXÉCUTION LOGIQUE MÉTIER (Commune Web et Bouton) ---
-// Retourne : 1 (Succès ON), 2 (Succès OFF), 0 (Echec)
-int executeAction(bool turnOn) {
-    lastActivityTime = millis(); // Reset timeout WiFi
-    initLoRa(); // S'assurer que LoRa est prêt
-    
-    int result = 0;
-    if(turnOn) result = sendCmd(CMD_RELAY_ON);
-    else result = sendCmd(CMD_RELAY_OFF);
-
-    // Feedback Visuel & Mise à jour Etat
-    ledsOff(); // Reset LEDs
-    
-    if (result == 1) {
-        webStatus = "ALLUME";
-        nextActionIsOn = false;
-        digitalWrite(PIN_LED_GREEN, HIGH);
-        delay(1000); // Feedback court
-    } 
-    else if (result == 2) {
-        webStatus = "ETEINT";
-        nextActionIsOn = true;
-        digitalWrite(PIN_LED_RED, HIGH);
-        delay(1000);
-    } 
-    else {
-        webStatus = "ERREUR COM";
-        // 3 Flashs Rouges
-        for(int i=0; i<3; i++) { digitalWrite(PIN_LED_RED, HIGH); delay(100); digitalWrite(PIN_LED_RED, LOW); delay(100); }
-    }
-    
-    ledsOff();
-    return result;
-}
-
-// --- MODE WIFI HYBRIDE ---
+// --- GESTION INTERFACE WEB + BOUTON ---
 void runWiFiMode() {
-    Serial.println(">>> ENTREE MODE WIFI AP");
-    digitalWrite(PIN_LED_BLUE, HIGH); // Bleu Fixe = WiFi Actif
-    
+    digitalWrite(PIN_LED_BLUE, HIGH);
     initLoRa();
     WiFi.softAP("TELECOMMANDE_SPORT", "admin1234");
     
-    // Configuration Serveur Web
-    server.on("/", [](){ String s=index_html; s.replace("%STATUS%", webStatus); server.send(200, "text/html", s); lastActivityTime=millis(); });
-    server.on("/on", [](){ 
-        executeAction(true); 
-        server.sendHeader("Location","/"); server.send(303); 
-        digitalWrite(PIN_LED_BLUE, HIGH); // Rallumer témoin WiFi après action
+    // Handler HTML Dynamique
+    server.on("/", [](){ 
+        String s=index_html; 
+        s.replace("%STATUS%", webStatus); 
+        s.replace("%RSSI%", lastRssiVal);
+        s.replace("%CODE%", String(rollingCode));
+        server.send(200, "text/html", s); 
+        lastActivityTime=millis(); 
     });
-    server.on("/off", [](){ 
-        executeAction(false); 
-        server.sendHeader("Location","/"); server.send(303); 
-        digitalWrite(PIN_LED_BLUE, HIGH); // Rallumer témoin WiFi après action
-    });
-    server.on("/status", [](){ 
-        server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); 
-    });
+
+    // Handlers Actions
+    auto handleAction = [](bool turnOn) {
+        int res = turnOn ? sendCmd(CMD_RELAY_ON) : sendCmd(CMD_RELAY_OFF);
+        if(res == 1) { webStatus="ALLUME"; nextActionIsOn=false; digitalWrite(PIN_LED_GREEN, HIGH); delay(500); }
+        else if(res == 2) { webStatus="ETEINT"; nextActionIsOn=true; digitalWrite(PIN_LED_RED, HIGH); delay(500); }
+        else { webStatus="ERREUR COM"; for(int i=0;i<3;i++){digitalWrite(PIN_LED_RED,HIGH);delay(50);digitalWrite(PIN_LED_RED,LOW);delay(50);} }
+        
+        ledsOff();
+        digitalWrite(PIN_LED_BLUE, HIGH); // Restaurer témoin WiFi
+        server.sendHeader("Location","/"); server.send(303);
+        lastActivityTime=millis();
+    };
+
+    server.on("/on", [](){ handleAction(true); });
+    server.on("/off", [](){ handleAction(false); });
+    server.on("/status", [](){ server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); });
     
     server.begin();
     lastActivityTime = millis();
 
-    // --- BOUCLE PRINCIPALE WIFI ---
+    // BOUCLE WIFI
     while(true) {
-        // 1. Gestion Clients Web
         server.handleClient();
-
-        // 2. Gestion Bouton Physique (Multifonction)
+        
+        // Bouton Physique dans mode WiFi (Sortie ou Action)
         if (digitalRead(PIN_BUTTON) == LOW) {
-            unsigned long pressStart = millis();
-            
-            // Attente relâchement ou détection long press
+            unsigned long p = millis();
             while(digitalRead(PIN_BUTTON) == LOW) {
-                // Si appui maintenu > 5 secondes -> SORTIE DU MODE WIFI
-                if(millis() - pressStart > 5000) {
-                    Serial.println(">>> SORTIE MANUELLE WIFI");
-                    // Animation de sortie (Clignote Bleu rapide)
-                    for(int i=0; i<10; i++) { digitalWrite(PIN_LED_BLUE, !digitalRead(PIN_LED_BLUE)); delay(100); }
-                    
-                    WiFi.mode(WIFI_OFF);
-                    ledsOff();
-                    return; // Retour au main loop -> Dodo
+                if(millis()-p > 5000) { // Sortie Manuelle
+                    WiFi.mode(WIFI_OFF); ledsOff(); return; 
                 }
                 delay(10);
             }
-            
-            // Si on arrive ici, c'est un Clic Court (< 5s)
-            // -> On déclenche l'action LoRa (Toggle)
-            if (nextActionIsOn) executeAction(true);
-            else executeAction(false);
-            
-            // Après l'action (qui a éteint les LEDs), on rallume le Bleu
-            // pour montrer qu'on est toujours en WiFi
-            digitalWrite(PIN_LED_BLUE, HIGH);
+            // Clic court -> Action
+            if(nextActionIsOn) handleAction(true); else handleAction(false);
         }
 
-        // 3. Gestion Timeout Inactivité
-        if(millis() - lastActivityTime > WIFI_TIMEOUT_MS) {
-            Serial.println(">>> TIMEOUT WIFI");
-            WiFi.mode(WIFI_OFF);
-            return;
-        }
-        
-        delay(5); // Petit repos CPU
+        if(millis() - lastActivityTime > WIFI_TIMEOUT_MS) { WiFi.mode(WIFI_OFF); return; }
+        delay(5);
     }
 }
 
 // --- LOGIQUE PRINCIPALE ---
 void processAction() {
-    Serial.println("Traitement...");
+    loadRollingCode(); // Charger dernier compteur
     unsigned long start = millis();
-
-    // 1. ANALYSE TYPE APPUI (Court ou Long ?)
-    // Tant que bouton appuyé
+    
+    // 1. Check WiFi (Appui Long)
     while(digitalRead(PIN_BUTTON) == LOW) {
-        // Animation d'attente (Clignote Bleu lent)
-        if(millis() - start > 200) { // On commence à clignoter après 200ms
-             if(((millis()-start)/250)%2==0) digitalWrite(PIN_LED_BLUE, HIGH);
-             else digitalWrite(PIN_LED_BLUE, LOW);
+        // Clignotement attente
+        if(millis() - start > 200) {
+            if(((millis()-start)/250)%2==0) digitalWrite(PIN_LED_BLUE, HIGH);
+            else digitalWrite(PIN_LED_BLUE, LOW);
         }
-
-        // SI APPUI > 5 SECONDES -> GO WIFI
+        // Activation
         if(millis() - start > 5000) {
             ledsOff();
-            runWiFiMode(); // On entre dans la boucle WiFi infinie
-            return; // Au retour, on sort de processAction pour aller dormir
+            runWiFiMode();
+            return;
         }
         delay(10);
     }
     ledsOff();
 
-    // 2. SI RELÂCHÉ AVANT 5s -> ACTION LORA SIMPLE
-    long pressDuration = millis() - start;
-    if(pressDuration > 50) {
+    // 2. Action LoRa (Clic Court)
+    if(millis() - start > 50) {
         initLoRa();
-        
-        // Action Toggle
-        if (nextActionIsOn) executeAction(true);
-        else executeAction(false);
-        
-        // Ici, contrairement au mode WiFi, on ne rallume pas le Bleu
-        // On laisse le feedback vert/rouge puis on sort pour dormir.
+        int result = 0;
+
+        if (nextActionIsOn) result = sendCmd(CMD_RELAY_ON);
+        else result = sendCmd(CMD_RELAY_OFF);
+
+        // Feedback
+        if (result == 1) {
+            digitalWrite(PIN_LED_GREEN, HIGH); 
+            nextActionIsOn = false; 
+            delay(FEEDBACK_DURATION); // Pause Feedback (Non-bloquant user possible ici si on veut)
+        } 
+        else if (result == 2) {
+            digitalWrite(PIN_LED_RED, HIGH); 
+            nextActionIsOn = true; 
+            delay(FEEDBACK_DURATION);
+        } 
+        else {
+            // Erreur
+            for(int i=0; i<3; i++) { digitalWrite(PIN_LED_RED,HIGH); delay(80); digitalWrite(PIN_LED_RED,LOW); delay(80); }
+        }
     }
+    ledsOff();
 }
 
-// --- SETUP ---
 void setup() {
-    bootCount++;
-    pinMode(PIN_LED_BLUE, OUTPUT);
-    pinMode(PIN_LED_RED, OUTPUT);
-    pinMode(PIN_LED_GREEN, OUTPUT);
+    pinMode(PIN_LED_BLUE, OUTPUT); pinMode(PIN_LED_RED, OUTPUT); pinMode(PIN_LED_GREEN, OUTPUT);
     ledsOff();
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     
-    Serial.begin(115200);
-    unsigned long s = millis();
-    while(!Serial && millis()-s < 500);
+    Serial.begin(115200); // Debug activé
     
-    Serial.println("\n--- BOOT ---");
-
-    // Si réveil par bouton ou premier boot avec bouton appuyé
-    if (digitalRead(PIN_BUTTON) == LOW) {
-        processAction();
-    }
+    // Si bouton appuyé au boot -> Action
+    if (digitalRead(PIN_BUTTON) == LOW) processAction();
 }
 
 void loop() {
-    // Sécurité relâchement bouton
-    while(digitalRead(PIN_BUTTON) == LOW) delay(10);
+    while(digitalRead(PIN_BUTTON) == LOW) delay(10); // Wait Release
     
     ledsOff();
     LoRa.end();
     WiFi.mode(WIFI_OFF);
     
-    Serial.println(">>> DODO");
+    Serial.println(">>> VEILLE");
     Serial.flush();
     Serial.end();
 
@@ -290,10 +289,9 @@ void loop() {
     esp_sleep_enable_gpio_wakeup();
     esp_light_sleep_start();
 
-    // --- REVEIL ---
+    // REVEIL
     Serial.begin(115200);
-    unsigned long ws = millis();
-    while(!Serial && (millis()-ws<1000));
+    unsigned long ws = millis(); while(!Serial && (millis()-ws<500));
     Serial.println("\n>>> REVEIL");
     
     processAction();
