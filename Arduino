@@ -1,7 +1,7 @@
 /*
  * PROJET : REMOTE LORA - DIAGNOSTIC VISUEL (LEDs)
  * CIBLE  : Seeed Studio XIAO ESP32C6
- * VERSION: 3.0 (Fix Hardware GPIO21 via LightSleep)
+ * VERSION: 3.1 (Fix Hardware GPIO21 + LOGS DÉTAILLÉS)
  */
 
 #include <Arduino.h>
@@ -9,15 +9,13 @@
 #include <LoRa.h>
 #include <WiFi.h>
 #include <WebServer.h>
-#include "driver/gpio.h" // Nécessaire pour le réveil Light Sleep
+#include "driver/gpio.h"
 
 // ==========================================
-// --- CONFIGURATION UTILISATEUR ---
+// --- CONFIGURATION ---
 // ==========================================
 
 #define DEVICE_ID           0x77 
-
-// LoRa Params
 #define LORA_FREQUENCY      433E6
 #define LORA_SF             12
 #define LORA_BW             125E3
@@ -25,31 +23,27 @@
 #define LORA_TX_POWER       20
 #define LORA_SYNC_WORD      0xF3
 
-// Commandes
 #define CMD_RELAY_ON        0xA1
 #define CMD_RELAY_OFF       0xB2
-#define CMD_GET_STATUS      0xC3
 #define ACK_RELAY_IS_ON     0xD4
 #define ACK_RELAY_IS_OFF    0xE5
 
-// Pinout (XIAO ESP32C6)
+// PINOUT XIAO ESP32C6
 #define PIN_LORA_RST    D0
 #define PIN_LORA_NSS    D1
 #define PIN_LORA_DIO0   D2
-#define PIN_BUTTON      D3  // GPIO 21 (Non-RTC Pin)
+#define PIN_BUTTON      D3  // GPIO 21
 #define PIN_LORA_MOSI   D4
 #define PIN_LORA_MISO   D5
 #define PIN_LORA_SCK    D6
 
-// LEDs
 #define PIN_LED_BLUE    D8
 #define PIN_LED_RED     D9
 #define PIN_LED_GREEN   D10
 
-// Timings
 #define FEEDBACK_DURATION   10000
 #define WIFI_TIMEOUT_MS     300000
-#define DEBUG_TIMEOUT_MS    120000
+#define DEBUG_TIMEOUT_MS    120000 // 2 minutes
 
 WebServer server(80);
 volatile unsigned long lastActivityTime = 0;
@@ -81,13 +75,13 @@ void signalTx() {
 
 void signalError() {
     ledsOff();
+    Serial.println("!!! ERREUR CRITIQUE (Signal Rouge) !!!");
     for(int i=0; i<5; i++) {
         digitalWrite(PIN_LED_RED, HIGH); delay(50);
         digitalWrite(PIN_LED_RED, LOW); delay(50);
     }
 }
 
-// --- SOLUTION LIGHT SLEEP POUR GPIO 21 ---
 void goToDeepSleep() {
     ledsOff(); 
     LoRa.end(); 
@@ -95,33 +89,34 @@ void goToDeepSleep() {
     WiFi.disconnect(true);
     WiFi.mode(WIFI_OFF);
 
-    Serial.println(">>> VEILLE (Light Sleep -> Restart)");
-    Serial.flush();
+    Serial.println(">>> MISE EN VEILLE (Light Sleep)");
+    Serial.println(">>> En attente d'appui bouton D3...");
+    Serial.flush(); // On attend que le message soit parti
 
-    // Configuration du réveil sur GPIO 21 (D3)
-    // GPIO_INTR_LOW_LEVEL = se réveille quand le bouton est maintenu à 0
+    // Configuration Light Sleep pour GPIO 21
     gpio_wakeup_enable((gpio_num_t)PIN_BUTTON, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
-
-    // On entre en sommeil léger (seule méthode compatible GPIO 21 sur C6)
     esp_light_sleep_start();
 
-    // --- AU REVEIL ---
-    // Une fois réveillé, le code reprend ICI.
-    // On force un redémarrage complet pour relancer le setup() proprement
-    // et réinitialiser toute la logique comme un "Deep Sleep".
+    // Au réveil (Appui bouton)
+    Serial.println("\n>>> REVEIL DETECTE ! Redemarrage...");
+    Serial.flush();
     ESP.restart();
 }
 
 void initLoRa() {
+    Serial.print("Init LoRa (SCK:D6, MISO:D5, MOSI:D4)... ");
     SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
     LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
     
     if (!LoRa.begin(LORA_FREQUENCY)) {
-        Serial.println("ERR: LoRa Fail");
+        Serial.println("[ECHEC]");
+        Serial.println("Verifiez le cablage et l'alimentation LoRa !");
         signalError();
         goToDeepSleep();
     }
+    Serial.println("[OK]");
+    
     LoRa.setSpreadingFactor(LORA_SF);
     LoRa.setSignalBandwidth(LORA_BW);
     LoRa.setCodingRate4(LORA_CR);
@@ -131,23 +126,40 @@ void initLoRa() {
 
 int sendCmd(uint8_t cmd) {
     signalTx();
+    
+    Serial.print("Envoi commande: 0x"); Serial.println(cmd, HEX);
+    
+    // Double Envoi
     for(int i=0; i<2; i++) {
+        Serial.print(" > Tentative "); Serial.print(i+1); Serial.print("/2...");
         LoRa.beginPacket(); LoRa.write(DEVICE_ID); LoRa.write(cmd); LoRa.endPacket();
+        Serial.println(" Fait.");
         delay(30);
     }
+    
+    Serial.println("Attente ACK (4 sec max)...");
     unsigned long s = millis();
     while(millis() - s < 4000) {
         if(LoRa.parsePacket()) {
             if(LoRa.available() >= 2) {
-                uint8_t id = LoRa.read(); uint8_t r = LoRa.read();
+                uint8_t id = LoRa.read(); 
+                uint8_t r = LoRa.read();
+                
+                Serial.print(" < Recu Packet -> ID:0x"); Serial.print(id, HEX);
+                Serial.print(" Data:0x"); Serial.println(r, HEX);
+
                 if(id == DEVICE_ID) {
-                    if(r == ACK_RELAY_IS_ON) return 1;
-                    if(r == ACK_RELAY_IS_OFF) return 2;
+                    if(r == ACK_RELAY_IS_ON) { Serial.println("ACK VALIDE: ON"); return 1; }
+                    if(r == ACK_RELAY_IS_OFF) { Serial.println("ACK VALIDE: OFF"); return 2; }
+                } else {
+                    Serial.println("Packet ignore (Mauvais ID)");
                 }
             }
         }
         delay(10);
     }
+    
+    Serial.println("TIMEOUT: Pas de reponse !");
     return 0;
 }
 
@@ -164,27 +176,32 @@ void setup() {
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     
     Serial.begin(115200);
-    delay(2000);
+    // Petit délai pour laisser le temps au port série USB de s'accrocher si on vient de redémarrer
+    delay(2000); 
 
-    // --- FENÊTRE DE DEBUG / MAINTENANCE ---
-    // Si bouton relâché au démarrage -> Mode Attente
+    // --- FENÊTRE DE DIAGNOSTIC ---
+    // Si bouton relâché au démarrage (ex: branchement USB)
     if (digitalRead(PIN_BUTTON) == HIGH) { 
-        Serial.println("\n### MODE MAINTENANCE ###");
-        unsigned long debugStart = millis();
+        Serial.println("\n\n=================================");
+        Serial.println("    REMOTE LORA - MODE DEBUG     ");
+        Serial.println("=================================");
+        Serial.println("Bouton relache au demarrage.");
+        Serial.println("Attente 2min. Appuyez sur le bouton pour tester.");
         
+        unsigned long debugStart = millis();
         while(millis() - debugStart < DEBUG_TIMEOUT_MS) {
             if(digitalRead(PIN_BUTTON) == LOW) {
-                // Bouton appuyé : on sort de la boucle
+                Serial.println("-> BOUTON APPUYE ! Lancement sequence...");
                 break; 
             }
-            // Clignotement lent
+            // Clignotement bleu lent "Alive"
             if ((millis() / 1000) % 2 == 0) digitalWrite(PIN_LED_BLUE, HIGH);
             else digitalWrite(PIN_LED_BLUE, LOW);
             delay(50);
         }
         
-        // Si toujours pas de bouton après timeout -> Dodo
         if(digitalRead(PIN_BUTTON) == HIGH) {
+            Serial.println("Timeout 2min sans action -> Dodo.");
             goToDeepSleep();
         }
     }
@@ -197,9 +214,11 @@ void setup() {
     // 1. Détection Appui Long (WiFi)
     while(digitalRead(PIN_BUTTON) == LOW) {
         if(millis() - start > 5000) {
+            Serial.println("MODE WIFI ACTIVE");
             digitalWrite(PIN_LED_BLUE, HIGH);
             initLoRa();
             WiFi.softAP("TELECOMMANDE_SPORT", "admin1234");
+            Serial.print("IP: "); Serial.println(WiFi.softAPIP());
             
             server.on("/", [](){ String s=index_html; s.replace("%STATUS%", webStatus); server.send(200, "text/html", s); lastActivityTime=millis(); });
             server.on("/on", [](){ int res = sendCmd(CMD_RELAY_ON); webStatus=(res==1)?"ALLUME":"ERREUR"; server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); });
@@ -209,25 +228,38 @@ void setup() {
             lastActivityTime = millis();
             while(true) { 
                 server.handleClient(); 
-                if(millis()-lastActivityTime > WIFI_TIMEOUT_MS) goToDeepSleep(); 
+                if(millis()-lastActivityTime > WIFI_TIMEOUT_MS) {
+                    Serial.println("Timeout WiFi -> Fin.");
+                    goToDeepSleep(); 
+                }
                 delay(2); 
             }
         } delay(10);
     }
 
     // 2. Détection Appui Court (LoRa)
+    // Anti-rebond simple (>50ms)
     if(millis() - start > 50) {
+        Serial.println("--- MODE COMMANDE LORA ---");
         initLoRa();
         int result = 0;
 
-        if(millis() - start > 1500) result = sendCmd(CMD_RELAY_OFF);
-        else result = sendCmd(CMD_RELAY_ON);
+        if(millis() - start > 1500) {
+            Serial.println("Action: CLIC LONG (OFF)");
+            result = sendCmd(CMD_RELAY_OFF);
+        } else {
+            Serial.println("Action: CLIC COURT (ON)");
+            result = sendCmd(CMD_RELAY_ON);
+        }
 
         if (result == 1) {
+            Serial.println("Resultat: SUCCES (ON) -> LED VERTE");
             digitalWrite(PIN_LED_GREEN, HIGH); delay(FEEDBACK_DURATION); 
         } else if (result == 2) {
+            Serial.println("Resultat: SUCCES (OFF) -> LED ROUGE");
             digitalWrite(PIN_LED_RED, HIGH); delay(3000); 
         } else {
+            Serial.println("Resultat: ECHEC -> FLASH ROUGE");
             signalError();
         }
     }
