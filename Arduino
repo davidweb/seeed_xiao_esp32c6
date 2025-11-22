@@ -1,7 +1,7 @@
 /*
- * PROJET : REMOTE LORA - MODE TOGGLE (ON/OFF ALTERNÉ)
+ * PROJET : REMOTE LORA - TOGGLE AVEC MEMOIRE RTC
  * CIBLE  : Seeed Studio XIAO ESP32C6
- * VERSION: 5.0 (Logic: Click=Toggle, LongPress=WiFi)
+ * VERSION: 5.1 (Fix: La mémoire survit au Reboot)
  */
 
 #include <Arduino.h>
@@ -48,13 +48,13 @@
 WebServer server(80);
 volatile unsigned long lastActivityTime = 0;
 String webStatus = "EN ATTENTE...";
-bool isFirstBoot = true; 
 
-// --- VARIABLE D'ÉTAT (Mémoire du Toggle) ---
-// true = Le prochain clic allumera
-// false = Le prochain clic éteindra
-// On commence par true (ON) au branchement batterie
-bool nextActionIsOn = true; 
+// --- VARIABLE MÉMOIRE CRITIQUE ---
+// RTC_DATA_ATTR permet à cette variable de garder sa valeur 
+// même si l'ESP32 redémarre (Soft Reset) ou sort de veille.
+RTC_DATA_ATTR bool nextActionIsOn = true; 
+// Compteur pour vérifier si on redémarre
+RTC_DATA_ATTR int bootCount = 0; 
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head><title>Remote</title>
@@ -93,7 +93,7 @@ void initLoRa() {
     LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
     
     if (!LoRa.begin(LORA_FREQUENCY)) {
-        signalError();
+        // Init silencieuse pour éviter blocage
         return;
     }
     
@@ -104,7 +104,6 @@ void initLoRa() {
     LoRa.setTxPower(LORA_TX_POWER);
 }
 
-// Retourne : 1 (Confirmé ON), 2 (Confirmé OFF), 0 (Erreur)
 int sendCmd(uint8_t cmd) {
     signalTx();
     if(Serial) { Serial.print("TX Cmd: 0x"); Serial.println(cmd, HEX); }
@@ -134,7 +133,12 @@ int sendCmd(uint8_t cmd) {
 // ==========================================
 
 void processAction() {
-    if(Serial) Serial.println(">>> ACTION !");
+    if(Serial) {
+        Serial.print(">>> ACTION ! BootCount: "); 
+        Serial.println(bootCount);
+        Serial.print(">>> Etat Mémoire RTC: ");
+        Serial.println(nextActionIsOn ? "DOIT ALLUMER (ON)" : "DOIT ETEINDRE (OFF)");
+    }
     
     unsigned long start = millis();
     
@@ -149,13 +153,13 @@ void processAction() {
             server.on("/", [](){ String s=index_html; s.replace("%STATUS%", webStatus); server.send(200, "text/html", s); lastActivityTime=millis(); });
             server.on("/on", [](){ 
                 int res = sendCmd(CMD_RELAY_ON); 
-                if(res==1) nextActionIsOn = false; // Mise à jour Toggle
+                if(res==1) nextActionIsOn = false; 
                 webStatus=(res==1)?"ALLUME":"ERREUR"; 
                 server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); 
             });
             server.on("/off", [](){ 
                 int res = sendCmd(CMD_RELAY_OFF); 
-                if(res==2) nextActionIsOn = true; // Mise à jour Toggle
+                if(res==2) nextActionIsOn = true; 
                 webStatus=(res==2)?"ETEINT":"ERREUR"; 
                 server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); 
             });
@@ -177,41 +181,40 @@ void processAction() {
     // 2. Gestion Clic Standard (Toggle ON/OFF)
     long pressDuration = millis() - start;
     
-    // Anti-rebond (>50ms) mais inférieur à 5000ms (car on a relâché le while)
     if(pressDuration > 50) {
         initLoRa();
         int result = 0;
 
-        // LOGIQUE TOGGLE ICI
+        // --- LOGIQUE TOGGLE ROBUSTE ---
         if (nextActionIsOn) {
-            if(Serial) Serial.println("Demande: ON");
+            // Si la mémoire dit qu'on doit allumer
             result = sendCmd(CMD_RELAY_ON);
         } else {
-            if(Serial) Serial.println("Demande: OFF");
+            // Si la mémoire dit qu'on doit éteindre
             result = sendCmd(CMD_RELAY_OFF);
         }
 
-        // GESTION DU RESULTAT ET MISE A JOUR DE L'ETAT
+        // --- MISE A JOUR INTELLIGENTE DE LA MEMOIRE ---
         if (result == 1) {
-            // Le récepteur a confirmé ON
-            if(Serial) Serial.println("ACK: ON -> Prochain clic sera OFF");
+            // RECU ACK "C'EST ALLUMÉ" (0xD4)
+            // Donc la prochaine fois, on devra éteindre.
+            if(Serial) Serial.println("ACK RECU: ON -> Next click = OFF");
             digitalWrite(PIN_LED_GREEN, HIGH); 
-            nextActionIsOn = false; // On a allumé, donc la prochaine fois on éteint
+            nextActionIsOn = false; 
             delay(FEEDBACK_DURATION); 
         } 
         else if (result == 2) {
-            // Le récepteur a confirmé OFF
-            if(Serial) Serial.println("ACK: OFF -> Prochain clic sera ON");
+            // RECU ACK "C'EST ÉTEINT" (0xE5)
+            // Donc la prochaine fois, on devra allumer.
+            if(Serial) Serial.println("ACK RECU: OFF -> Next click = ON");
             digitalWrite(PIN_LED_RED, HIGH); 
-            nextActionIsOn = true; // On a éteint, donc la prochaine fois on allume
+            nextActionIsOn = true; 
             delay(3000); 
         } 
         else {
-            // Pas de réponse
-            if(Serial) Serial.println("NO ACK -> On garde le meme etat cible");
+            // Pas de réponse valide
+            if(Serial) Serial.println("ERREUR / NO ACK -> Etat mémoire inchangé");
             signalError();
-            // Note: On ne change pas 'nextActionIsOn' car on n'est pas sûr que ça a marché.
-            // L'utilisateur devra réappuyer pour réessayer la même action.
         }
     }
     ledsOff();
@@ -222,6 +225,8 @@ void processAction() {
 // ==========================================
 
 void setup() {
+    bootCount++; // On incrémente le compteur de redémarrage
+
     pinMode(PIN_LED_BLUE, OUTPUT);
     pinMode(PIN_LED_RED, OUTPUT);
     pinMode(PIN_LED_GREEN, OUTPUT);
@@ -232,8 +237,9 @@ void setup() {
     Serial.begin(115200);
     delay(2000); 
 
-    // Debug au branchement
-    if (isFirstBoot && digitalRead(PIN_BUTTON) == HIGH) { 
+    // Debug uniquement si c'est un "Vrai" premier démarrage (pas un réveil veille)
+    // On considère que si bootCount est petit (<2) c'est le branchement USB/Batterie
+    if (bootCount < 2 && digitalRead(PIN_BUTTON) == HIGH) { 
         Serial.println("--- DEBUG MODE (2min) ---");
         unsigned long debugStart = millis();
         bool action = false;
@@ -246,44 +252,45 @@ void setup() {
         ledsOff();
         if(action) processAction();
     }
-    isFirstBoot = false; 
+    
+    // Si on arrive ici directement (reset ou wake), on vérifie si le bouton est enfoncé
+    if (bootCount >= 2 && digitalRead(PIN_BUTTON) == LOW) {
+        // C'est un réveil par le bouton (probablement après un crash/reset LightSleep)
+        processAction();
+    }
 }
 
 void loop() {
-    // 1. SECURITE : Attendre relâchement du bouton
-    while(digitalRead(PIN_BUTTON) == LOW) {
-        delay(10);
-    }
+    // 1. SECURITE : Attendre relâchement
+    while(digitalRead(PIN_BUTTON) == LOW) delay(10);
 
-    // 2. PREPARATION SOMMEIL
+    // 2. DODO
     ledsOff();
     LoRa.end();
     WiFi.mode(WIFI_OFF);
     
     if(Serial) {
-        Serial.println(">>> DODO (USB OFF)");
+        Serial.println(">>> DODO (USB Coupé)");
         Serial.flush();
         Serial.end();
     }
 
-    // 3. CONFIGURATION GPIO WAKEUP
     gpio_set_direction((gpio_num_t)PIN_BUTTON, GPIO_MODE_INPUT);
     gpio_pullup_en((gpio_num_t)PIN_BUTTON);
     gpio_wakeup_enable((gpio_num_t)PIN_BUTTON, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
     
-    // 4. SOMMEIL LEGER (Garde la RAM, donc garde l'état nextActionIsOn)
     esp_light_sleep_start();
 
     // ================= REVEIL =================
-    
-    // 5. RESTAURATION USB
+    // Note : Si ça plante ici, le setup() redémarrera.
+    // Grâce à RTC_DATA_ATTR, 'nextActionIsOn' sera conservé même si ça plante !
+
     Serial.begin(115200);
     unsigned long wakeStart = millis();
     while(!Serial && (millis() - wakeStart < 500)); 
 
     if(Serial) Serial.println("\n>>> REVEIL !");
     
-    // 6. TRAITEMENT
     processAction();
 }
