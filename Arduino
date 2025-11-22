@@ -1,7 +1,7 @@
 /*
  * PROJET : REMOTE LORA - DIAGNOSTIC VISUEL (LEDs)
  * CIBLE  : Seeed Studio XIAO ESP32C6
- * VERSION: 4.0 (Architecture LightSleep sans Reboot)
+ * VERSION: 4.1 (Fix USB Serial Crash & Light Sleep)
  */
 
 #include <Arduino.h>
@@ -28,7 +28,7 @@
 #define ACK_RELAY_IS_ON     0xD4
 #define ACK_RELAY_IS_OFF    0xE5
 
-// PINOUT XIAO ESP32C6
+// PINOUT
 #define PIN_LORA_RST    D0
 #define PIN_LORA_NSS    D1
 #define PIN_LORA_DIO0   D2
@@ -48,7 +48,7 @@
 WebServer server(80);
 volatile unsigned long lastActivityTime = 0;
 String webStatus = "EN ATTENTE...";
-bool isFirstBoot = true; // Pour gérer le délai de 2min uniquement au branchement électrique
+bool isFirstBoot = true; 
 
 const char index_html[] PROGMEM = R"rawliteral(
 <!DOCTYPE HTML><html><head><title>Remote</title>
@@ -61,7 +61,7 @@ const char index_html[] PROGMEM = R"rawliteral(
 <a href="/status"><button class="btn ref">ACTUALISER</button></a></body></html>)rawliteral";
 
 // ==========================================
-// --- FONCTIONS UTILITAIRES ---
+// --- FONCTIONS ---
 // ==========================================
 
 void ledsOff() {
@@ -76,22 +76,19 @@ void signalTx() {
 
 void signalError() {
     ledsOff();
-    Serial.println("!!! ERREUR (Signal Rouge) !!!");
-    for(int i=0; i<5; i++) {
-        digitalWrite(PIN_LED_RED, HIGH); delay(50);
-        digitalWrite(PIN_LED_RED, LOW); delay(50);
+    // Flash Rouge pour erreur
+    for(int i=0; i<3; i++) {
+        digitalWrite(PIN_LED_RED, HIGH); delay(100);
+        digitalWrite(PIN_LED_RED, LOW); delay(100);
     }
 }
 
-// --- INITIALISATION LORA ---
 void initLoRa() {
-    // On ne ré-initialise pas si c'est déjà fait, sauf besoin spécifique
-    // Mais pour la robustesse, on le refait à chaque réveil "radio"
     SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
     LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
     
     if (!LoRa.begin(LORA_FREQUENCY)) {
-        Serial.println("ERREUR: LoRa Fail");
+        // En cas d'échec silencieux ici pour éviter crash USB
         signalError();
         return;
     }
@@ -103,25 +100,22 @@ void initLoRa() {
     LoRa.setTxPower(LORA_TX_POWER);
 }
 
-// --- ENVOI COMMANDE ---
 int sendCmd(uint8_t cmd) {
     signalTx();
-    Serial.print("Envoi 0x"); Serial.println(cmd, HEX);
+    if(Serial) { Serial.print("TX Cmd: 0x"); Serial.println(cmd, HEX); }
     
     for(int i=0; i<2; i++) {
         LoRa.beginPacket(); LoRa.write(DEVICE_ID); LoRa.write(cmd); LoRa.endPacket();
         delay(30);
     }
     
-    Serial.println("Attente ACK...");
     unsigned long s = millis();
     while(millis() - s < 4000) {
         if(LoRa.parsePacket()) {
             if(LoRa.available() >= 2) {
                 uint8_t id = LoRa.read(); uint8_t r = LoRa.read();
                 if(id == DEVICE_ID) {
-                    if(r == ACK_RELAY_IS_ON) return 1;
-                    if(r == ACK_RELAY_IS_OFF) return 2;
+                    return (r == ACK_RELAY_IS_ON) ? 1 : (r == ACK_RELAY_IS_OFF) ? 2 : 0;
                 }
             }
         }
@@ -131,26 +125,21 @@ int sendCmd(uint8_t cmd) {
 }
 
 // ==========================================
-// --- LOGIQUE PRINCIPALE ---
+// --- LOGIQUE METIER ---
 // ==========================================
 
 void processAction() {
-    Serial.println(">>> Traitement Action Bouton");
+    if(Serial) Serial.println(">>> ACTION !");
     
     unsigned long start = millis();
     
-    // 1. TANT QUE LE BOUTON EST APPUYÉ (Gestion Long Press)
-    // On attend de voir si l'utilisateur maintient pour le WiFi
+    // 1. Gestion Appui Long (WiFi)
     while(digitalRead(PIN_BUTTON) == LOW) {
-        
-        // --- MODE WIFI (Appui > 5s) ---
         if(millis() - start > 5000) {
-            Serial.println("--- ACTIVATION WIFI (AP) ---");
             digitalWrite(PIN_LED_BLUE, HIGH);
-            
-            initLoRa(); // Nécessaire pour envoyer les commandes via web
+            initLoRa();
             WiFi.softAP("TELECOMMANDE_SPORT", "admin1234");
-            Serial.print("IP: "); Serial.println(WiFi.softAPIP());
+            if(Serial) { Serial.print("WIFI AP IP: "); Serial.println(WiFi.softAPIP()); }
             
             server.on("/", [](){ String s=index_html; s.replace("%STATUS%", webStatus); server.send(200, "text/html", s); lastActivityTime=millis(); });
             server.on("/on", [](){ int res = sendCmd(CMD_RELAY_ON); webStatus=(res==1)?"ALLUME":"ERREUR"; server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); });
@@ -158,54 +147,37 @@ void processAction() {
             server.begin(); 
             
             lastActivityTime = millis();
-            
-            // Boucle WiFi
             while(true) { 
                 server.handleClient(); 
-                // Timeout Wifi
                 if(millis()-lastActivityTime > WIFI_TIMEOUT_MS) {
-                    Serial.println("Fin WiFi -> Retour veille.");
                     WiFi.mode(WIFI_OFF);
-                    return; // On sort de la fonction pour aller dormir
+                    return; 
                 }
                 delay(2); 
             }
         }
-        delay(10); // Petit délai pour ne pas saturer le CPU dans la boucle while
+        delay(10);
     }
 
-    // 2. BOUTON RELACHÉ (Clic court ou long < 5s)
-    // Si on est arrivé ici, c'est que le bouton a été relâché avant 5s
-    // On vérifie qu'il a été appuyé au moins 50ms (anti-rebond)
+    // 2. Gestion Clic LoRa
     long pressDuration = millis() - start;
-    
     if(pressDuration > 50) {
         initLoRa();
         int result = 0;
+        if(pressDuration > 1500) result = sendCmd(CMD_RELAY_OFF);
+        else result = sendCmd(CMD_RELAY_ON);
 
-        if(pressDuration > 1500) {
-            Serial.println("CMD: OFF (Clic long)");
-            result = sendCmd(CMD_RELAY_OFF);
-        } else {
-            Serial.println("CMD: ON (Clic court)");
-            result = sendCmd(CMD_RELAY_ON);
-        }
-
-        // Feedback
         if (result == 1) {
-            Serial.println("SUCCES ON");
+            if(Serial) Serial.println("ACK: ON");
             digitalWrite(PIN_LED_GREEN, HIGH); delay(FEEDBACK_DURATION); 
         } else if (result == 2) {
-            Serial.println("SUCCES OFF");
+            if(Serial) Serial.println("ACK: OFF");
             digitalWrite(PIN_LED_RED, HIGH); delay(3000); 
         } else {
-            Serial.println("ECHEC / NO ACK");
+            if(Serial) Serial.println("NO ACK");
             signalError();
         }
-    } else {
-        Serial.println("Appui trop court (parasite ?)");
     }
-    
     ledsOff();
 }
 
@@ -219,78 +191,66 @@ void setup() {
     pinMode(PIN_LED_GREEN, OUTPUT);
     ledsOff();
 
-    // Configuration explicite du bouton
     pinMode(PIN_BUTTON, INPUT_PULLUP);
     
     Serial.begin(115200);
     delay(2000); 
 
-    // --- FENÊTRE DE DIAGNOSTIC (Uniquement au 1er boot électrique) ---
+    // Debug au branchement
     if (isFirstBoot && digitalRead(PIN_BUTTON) == HIGH) { 
-        Serial.println("\n--- MODE DEBUG (2min) ---");
+        Serial.println("--- DEBUG MODE (2min) ---");
         unsigned long debugStart = millis();
-        bool actionDetected = false;
-        
+        bool action = false;
         while(millis() - debugStart < DEBUG_TIMEOUT_MS) {
-            if(digitalRead(PIN_BUTTON) == LOW) {
-                actionDetected = true;
-                break; // On sort pour traiter l'action
-            }
-            // Heartbeat visuel lent
+            if(digitalRead(PIN_BUTTON) == LOW) { action = true; break; }
             if ((millis() / 1000) % 2 == 0) digitalWrite(PIN_LED_BLUE, HIGH);
             else digitalWrite(PIN_LED_BLUE, LOW);
             delay(50);
         }
-        
         ledsOff();
-        
-        // Si on a appuyé sur le bouton pendant le debug, on traite l'action tout de suite
-        if(actionDetected) {
-            processAction();
-        }
+        if(action) processAction();
     }
-    
-    // Le setup est fini, on passe au loop qui gère la veille
     isFirstBoot = false; 
 }
 
 void loop() {
-    // 1. MISE EN VEILLE
-    // Avant de dormir, on s'assure que tout est éteint
+    // 1. SECURITE : Attendre relâchement du bouton
+    // Si on s'endort bouton appuyé, on se réveille direct et on boucle
+    while(digitalRead(PIN_BUTTON) == LOW) {
+        delay(10);
+    }
+
+    // 2. PREPARATION SOMMEIL
     ledsOff();
     LoRa.end();
     WiFi.mode(WIFI_OFF);
     
-    Serial.println("\n>>> DODO (En attente D3...)");
-    Serial.flush(); // IMPORTANT : attendre la fin des logs
+    Serial.println(">>> DODO (USB va couper)");
+    Serial.flush(); // Attendre fin impression
+    Serial.end();   // IMPORTANT : Couper USB pour éviter crash au réveil
 
-    // CONFIGURATION CRITIQUE POUR REVEIL ESP32-C6 VIA GPIO
-    // 1. Activer le mode INPUT
+    // 3. CONFIGURATION GPIO WAKEUP
     gpio_set_direction((gpio_num_t)PIN_BUTTON, GPIO_MODE_INPUT);
-    // 2. FORCER LE PULL-UP (Essentiel sur C6 pour wake-up LOW)
     gpio_pullup_en((gpio_num_t)PIN_BUTTON);
-    // 3. Activer le réveil sur niveau bas
     gpio_wakeup_enable((gpio_num_t)PIN_BUTTON, GPIO_INTR_LOW_LEVEL);
-    // 4. Activer la fonctionnalité wake-up
     esp_sleep_enable_gpio_wakeup();
     
-    // 5. Light Sleep (Le CPU s'arrête mais la RAM est conservée)
+    // 4. SOMMEIL LEGER
     esp_light_sleep_start();
 
-    // -----------------------------------------------------------
-    // 2. REVEIL
-    // Le code reprend EXACTEMENT ICI après l'appui sur le bouton
-    // -----------------------------------------------------------
+    // ================= REVEIL =================
     
-    Serial.println(">>> REVEIL !");
+    // 5. RESTAURATION USB
+    // On relance le port série immédiatement
+    Serial.begin(115200);
+    // On attend un tout petit peu que l'USB remonte (optionnel mais conseillé)
+    unsigned long wakeStart = millis();
+    while(!Serial && (millis() - wakeStart < 500)); 
+
+    Serial.println("\n>>> REVEIL !");
     
-    // Petite pause pour stabiliser le signal bouton
-    delay(10); 
-    
-    // On traite l'action (envoi LoRa ou WiFi)
-    // Note : Le bouton est probablement encore appuyé par l'utilisateur à ce moment précis
+    // 6. TRAITEMENT
+    // Le bouton vient de réveiller l'ESP, donc il est probablement encore appuyé
+    // ou vient d'être relâché. On lance l'action.
     processAction();
-    
-    // Une fois l'action finie (ou timeout WiFi), la boucle loop() recommence
-    // et nous renvoie en sommeil au point 1.
 }
