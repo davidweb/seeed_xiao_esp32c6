@@ -1,7 +1,7 @@
 /*
  * PROJET : REMOTE LORA - V2.0 INDUSTRIEL (SECURISE + RSSI)
  * CIBLE  : Seeed Studio XIAO ESP32C6
- * AUTEUR : Assistant IA
+ * AUTEUR : Neorak
  */
 
 #include <Arduino.h>
