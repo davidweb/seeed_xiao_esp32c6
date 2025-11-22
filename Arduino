@@ -1,7 +1,7 @@
 /*
- * PROJET : REMOTE LORA - TOGGLE AVEC MEMOIRE RTC
+ * PROJET : REMOTE LORA - FIX ACK RECEPTION
  * CIBLE  : Seeed Studio XIAO ESP32C6
- * VERSION: 5.1 (Fix: La mémoire survit au Reboot)
+ * VERSION: 5.2
  */
 
 #include <Arduino.h>
@@ -11,10 +11,7 @@
 #include <WebServer.h>
 #include "driver/gpio.h"
 
-// ==========================================
 // --- CONFIGURATION ---
-// ==========================================
-
 #define DEVICE_ID           0x77 
 #define LORA_FREQUENCY      433E6
 #define LORA_SF             12
@@ -32,7 +29,7 @@
 #define PIN_LORA_RST    D0
 #define PIN_LORA_NSS    D1
 #define PIN_LORA_DIO0   D2
-#define PIN_BUTTON      D3  // GPIO 21
+#define PIN_BUTTON      D3
 #define PIN_LORA_MOSI   D4
 #define PIN_LORA_MISO   D5
 #define PIN_LORA_SCK    D6
@@ -49,11 +46,8 @@ WebServer server(80);
 volatile unsigned long lastActivityTime = 0;
 String webStatus = "EN ATTENTE...";
 
-// --- VARIABLE MÉMOIRE CRITIQUE ---
-// RTC_DATA_ATTR permet à cette variable de garder sa valeur 
-// même si l'ESP32 redémarre (Soft Reset) ou sort de veille.
+// Variables mémoire persistante
 RTC_DATA_ATTR bool nextActionIsOn = true; 
-// Compteur pour vérifier si on redémarre
 RTC_DATA_ATTR int bootCount = 0; 
 
 const char index_html[] PROGMEM = R"rawliteral(
@@ -65,10 +59,6 @@ const char index_html[] PROGMEM = R"rawliteral(
 </head><body><h1>CONTROLE TERRAIN</h1><p>Etat: <b>%STATUS%</b></p>
 <a href="/on"><button class="btn on">ALLUMER</button></a><a href="/off"><button class="btn off">ETEINDRE</button></a>
 <a href="/status"><button class="btn ref">ACTUALISER</button></a></body></html>)rawliteral";
-
-// ==========================================
-// --- FONCTIONS ---
-// ==========================================
 
 void ledsOff() {
     digitalWrite(PIN_LED_BLUE, LOW);
@@ -91,12 +81,7 @@ void signalError() {
 void initLoRa() {
     SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_NSS);
     LoRa.setPins(PIN_LORA_NSS, PIN_LORA_RST, PIN_LORA_DIO0);
-    
-    if (!LoRa.begin(LORA_FREQUENCY)) {
-        // Init silencieuse pour éviter blocage
-        return;
-    }
-    
+    if (!LoRa.begin(LORA_FREQUENCY)) return;
     LoRa.setSpreadingFactor(LORA_SF);
     LoRa.setSignalBandwidth(LORA_BW);
     LoRa.setCodingRate4(LORA_CR);
@@ -104,129 +89,108 @@ void initLoRa() {
     LoRa.setTxPower(LORA_TX_POWER);
 }
 
+// --- NOUVELLE LOGIQUE D'ENVOI INTELLIGENTE ---
 int sendCmd(uint8_t cmd) {
-    signalTx();
-    if(Serial) { Serial.print("TX Cmd: 0x"); Serial.println(cmd, HEX); }
-    
-    for(int i=0; i<2; i++) {
-        LoRa.beginPacket(); LoRa.write(DEVICE_ID); LoRa.write(cmd); LoRa.endPacket();
-        delay(30);
-    }
-    
-    unsigned long s = millis();
-    while(millis() - s < 4000) {
-        if(LoRa.parsePacket()) {
-            if(LoRa.available() >= 2) {
-                uint8_t id = LoRa.read(); uint8_t r = LoRa.read();
-                if(id == DEVICE_ID) {
-                    return (r == ACK_RELAY_IS_ON) ? 1 : (r == ACK_RELAY_IS_OFF) ? 2 : 0;
+    // On essaie jusqu'à 3 fois d'envoyer et d'attendre la réponse
+    for(int attempt = 1; attempt <= 3; attempt++) {
+        
+        signalTx();
+        if(Serial) { Serial.print("Tentative TX #"); Serial.print(attempt); Serial.println("..."); }
+        
+        // 1. Envoi du paquet
+        LoRa.beginPacket(); 
+        LoRa.write(DEVICE_ID); 
+        LoRa.write(cmd); 
+        LoRa.endPacket();
+        
+        // 2. Passage immédiat en réception
+        LoRa.receive(); 
+        
+        // 3. Attente ACK (Max 600ms par tentative)
+        unsigned long s = millis();
+        while(millis() - s < 600) {
+            int packetSize = LoRa.parsePacket();
+            if(packetSize) {
+                if(LoRa.available() >= 2) {
+                    uint8_t id = LoRa.read(); 
+                    uint8_t r = LoRa.read();
+                    
+                    if(id == DEVICE_ID) {
+                        // BINGO ! On a la réponse
+                        if(r == ACK_RELAY_IS_ON) return 1;
+                        if(r == ACK_RELAY_IS_OFF) return 2;
+                    }
                 }
             }
+            delay(5); // Petite pause pour stabilité
         }
-        delay(10);
+        
+        // Si on arrive ici, c'est qu'on a pas eu de réponse à cette tentative
+        if(Serial) Serial.println("Pas de reponse, on retente...");
+        delay(100); // Petite pause aléatoire avant de réessayer
     }
-    return 0;
+    
+    return 0; // Echec total après 3 essais
 }
-
-// ==========================================
-// --- LOGIQUE METIER ---
-// ==========================================
 
 void processAction() {
     if(Serial) {
-        Serial.print(">>> ACTION ! BootCount: "); 
-        Serial.println(bootCount);
-        Serial.print(">>> Etat Mémoire RTC: ");
-        Serial.println(nextActionIsOn ? "DOIT ALLUMER (ON)" : "DOIT ETEINDRE (OFF)");
+        Serial.print(">>> ACTION ! BootCount: "); Serial.println(bootCount);
+        Serial.print(">>> Cible Mémoire: "); Serial.println(nextActionIsOn ? "ON" : "OFF");
     }
     
     unsigned long start = millis();
     
-    // 1. Gestion Appui Long (> 5s) -> WIFI
+    // WiFi Check (>5s)
     while(digitalRead(PIN_BUTTON) == LOW) {
         if(millis() - start > 5000) {
             digitalWrite(PIN_LED_BLUE, HIGH);
             initLoRa();
             WiFi.softAP("TELECOMMANDE_SPORT", "admin1234");
-            if(Serial) { Serial.print("WIFI AP IP: "); Serial.println(WiFi.softAPIP()); }
-            
             server.on("/", [](){ String s=index_html; s.replace("%STATUS%", webStatus); server.send(200, "text/html", s); lastActivityTime=millis(); });
-            server.on("/on", [](){ 
-                int res = sendCmd(CMD_RELAY_ON); 
-                if(res==1) nextActionIsOn = false; 
-                webStatus=(res==1)?"ALLUME":"ERREUR"; 
-                server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); 
-            });
-            server.on("/off", [](){ 
-                int res = sendCmd(CMD_RELAY_OFF); 
-                if(res==2) nextActionIsOn = true; 
-                webStatus=(res==2)?"ETEINT":"ERREUR"; 
-                server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); 
-            });
+            server.on("/on", [](){ int res = sendCmd(CMD_RELAY_ON); if(res==1) nextActionIsOn=false; webStatus=(res==1)?"ALLUME":"ERREUR"; server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); });
+            server.on("/off", [](){ int res = sendCmd(CMD_RELAY_OFF); if(res==2) nextActionIsOn=true; webStatus=(res==2)?"ETEINT":"ERREUR"; server.sendHeader("Location","/"); server.send(303); lastActivityTime=millis(); });
             server.begin(); 
-            
             lastActivityTime = millis();
             while(true) { 
                 server.handleClient(); 
-                if(millis()-lastActivityTime > WIFI_TIMEOUT_MS) {
-                    WiFi.mode(WIFI_OFF);
-                    return; 
-                }
+                if(millis()-lastActivityTime > WIFI_TIMEOUT_MS) { WiFi.mode(WIFI_OFF); return; }
                 delay(2); 
             }
         }
         delay(10);
     }
 
-    // 2. Gestion Clic Standard (Toggle ON/OFF)
     long pressDuration = millis() - start;
-    
     if(pressDuration > 50) {
         initLoRa();
         int result = 0;
 
-        // --- LOGIQUE TOGGLE ROBUSTE ---
-        if (nextActionIsOn) {
-            // Si la mémoire dit qu'on doit allumer
-            result = sendCmd(CMD_RELAY_ON);
-        } else {
-            // Si la mémoire dit qu'on doit éteindre
-            result = sendCmd(CMD_RELAY_OFF);
-        }
+        if (nextActionIsOn) result = sendCmd(CMD_RELAY_ON);
+        else result = sendCmd(CMD_RELAY_OFF);
 
-        // --- MISE A JOUR INTELLIGENTE DE LA MEMOIRE ---
         if (result == 1) {
-            // RECU ACK "C'EST ALLUMÉ" (0xD4)
-            // Donc la prochaine fois, on devra éteindre.
-            if(Serial) Serial.println("ACK RECU: ON -> Next click = OFF");
+            if(Serial) Serial.println("ACK: ON -> Next click = OFF");
             digitalWrite(PIN_LED_GREEN, HIGH); 
             nextActionIsOn = false; 
             delay(FEEDBACK_DURATION); 
         } 
         else if (result == 2) {
-            // RECU ACK "C'EST ÉTEINT" (0xE5)
-            // Donc la prochaine fois, on devra allumer.
-            if(Serial) Serial.println("ACK RECU: OFF -> Next click = ON");
+            if(Serial) Serial.println("ACK: OFF -> Next click = ON");
             digitalWrite(PIN_LED_RED, HIGH); 
             nextActionIsOn = true; 
             delay(3000); 
         } 
         else {
-            // Pas de réponse valide
-            if(Serial) Serial.println("ERREUR / NO ACK -> Etat mémoire inchangé");
+            if(Serial) Serial.println("ECHEC -> Pas de chgt etat");
             signalError();
         }
     }
     ledsOff();
 }
 
-// ==========================================
-// --- SETUP & LOOP ---
-// ==========================================
-
 void setup() {
-    bootCount++; // On incrémente le compteur de redémarrage
-
+    bootCount++;
     pinMode(PIN_LED_BLUE, OUTPUT);
     pinMode(PIN_LED_RED, OUTPUT);
     pinMode(PIN_LED_GREEN, OUTPUT);
@@ -237,10 +201,8 @@ void setup() {
     Serial.begin(115200);
     delay(2000); 
 
-    // Debug uniquement si c'est un "Vrai" premier démarrage (pas un réveil veille)
-    // On considère que si bootCount est petit (<2) c'est le branchement USB/Batterie
     if (bootCount < 2 && digitalRead(PIN_BUTTON) == HIGH) { 
-        Serial.println("--- DEBUG MODE (2min) ---");
+        Serial.println("--- DEBUG (2min) ---");
         unsigned long debugStart = millis();
         bool action = false;
         while(millis() - debugStart < DEBUG_TIMEOUT_MS) {
@@ -253,44 +215,25 @@ void setup() {
         if(action) processAction();
     }
     
-    // Si on arrive ici directement (reset ou wake), on vérifie si le bouton est enfoncé
-    if (bootCount >= 2 && digitalRead(PIN_BUTTON) == LOW) {
-        // C'est un réveil par le bouton (probablement après un crash/reset LightSleep)
-        processAction();
-    }
+    if (bootCount >= 2 && digitalRead(PIN_BUTTON) == LOW) processAction();
 }
 
 void loop() {
-    // 1. SECURITE : Attendre relâchement
     while(digitalRead(PIN_BUTTON) == LOW) delay(10);
-
-    // 2. DODO
     ledsOff();
     LoRa.end();
     WiFi.mode(WIFI_OFF);
-    
-    if(Serial) {
-        Serial.println(">>> DODO (USB Coupé)");
-        Serial.flush();
-        Serial.end();
-    }
+    if(Serial) { Serial.println(">>> DODO"); Serial.flush(); Serial.end(); }
 
     gpio_set_direction((gpio_num_t)PIN_BUTTON, GPIO_MODE_INPUT);
     gpio_pullup_en((gpio_num_t)PIN_BUTTON);
     gpio_wakeup_enable((gpio_num_t)PIN_BUTTON, GPIO_INTR_LOW_LEVEL);
     esp_sleep_enable_gpio_wakeup();
-    
     esp_light_sleep_start();
 
-    // ================= REVEIL =================
-    // Note : Si ça plante ici, le setup() redémarrera.
-    // Grâce à RTC_DATA_ATTR, 'nextActionIsOn' sera conservé même si ça plante !
-
     Serial.begin(115200);
-    unsigned long wakeStart = millis();
-    while(!Serial && (millis() - wakeStart < 500)); 
-
-    if(Serial) Serial.println("\n>>> REVEIL !");
-    
+    unsigned long ws = millis();
+    while(!Serial && (millis()-ws<500)); 
+    if(Serial) Serial.println("\n>>> REVEIL");
     processAction();
 }
