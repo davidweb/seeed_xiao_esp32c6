@@ -1,20 +1,17 @@
 /*
- * PROJET : ACTUATOR LORA INDUSTRIAL (RECEPTEUR)
+ * PROJET : ACTUATOR LORA - SYNC FIX
  * CIBLE  : ESP32 Dev Module
- * ARCHI  : FreeRTOS Dual Task
  */
 
 #include <Arduino.h>
 #include <SPI.h>
 #include <LoRa.h>
 
-// --- CONFIGURATION LORA (Doit être identique) ---
 #define DEVICE_ID           0x77 
 #define LORA_FREQUENCY      433E6
 #define LORA_SF             12
 #define LORA_BW             125E3
 #define LORA_CR             8
-#define LORA_TX_POWER       20
 #define LORA_SYNC_WORD      0xF3
 
 #define CMD_RELAY_ON        0xA1
@@ -22,9 +19,9 @@
 #define CMD_GET_STATUS      0xC3
 #define ACK_RELAY_IS_ON     0xD4
 #define ACK_RELAY_IS_OFF    0xE5
-#define AUTO_OFF_TIMEOUT    14400000 // 4 Heures (Sécurité)
+#define AUTO_OFF_TIMEOUT    14400000 
 
-// --- PINOUT ESP32 STANDARD ---
+// PINOUT ESP32 Standard
 #define PIN_LORA_SS     5
 #define PIN_LORA_RST    14
 #define PIN_LORA_DIO0   2
@@ -33,115 +30,106 @@
 #define PIN_LORA_MISO   19
 #define PIN_LORA_SCK    18
 
-// --- FREERTOS OBJECTS ---
 QueueHandle_t cmdQueue;
 unsigned long relayOnTime = 0;
 bool isRelayOn = false;
 
-// --- TÂCHE 1 : LOGIQUE RELAIS & SÉCURITÉ ---
+// --- TÂCHE RELAIS ---
 void taskRelay(void *pvParameters) {
     pinMode(PIN_RELAY, OUTPUT); 
-    digitalWrite(PIN_RELAY, LOW); // Etat stable OFF
+    digitalWrite(PIN_RELAY, LOW); 
 
     uint8_t cmd;
     for (;;) {
-        // Attente commande (non-bloquant)
         if (xQueueReceive(cmdQueue, &cmd, pdMS_TO_TICKS(1000)) == pdTRUE) {
             if (cmd == CMD_RELAY_ON) { 
-                Serial.println("RELAY -> ON");
+                Serial.println("ACTION: RELAY ON");
                 digitalWrite(PIN_RELAY, HIGH); 
                 isRelayOn = true; 
                 relayOnTime = millis(); 
             } 
             else if (cmd == CMD_RELAY_OFF) { 
-                Serial.println("RELAY -> OFF");
+                Serial.println("ACTION: RELAY OFF");
                 digitalWrite(PIN_RELAY, LOW); 
                 isRelayOn = false; 
             }
         }
-
-        // Watchdog Sécurité : Auto-Off
+        // Auto-Off Sécurité
         if (isRelayOn && (millis() - relayOnTime > AUTO_OFF_TIMEOUT)) { 
-            Serial.println("AUTO-OFF TRIGGERED");
-            digitalWrite(PIN_RELAY, LOW); 
-            isRelayOn = false; 
+            digitalWrite(PIN_RELAY, LOW); isRelayOn = false; 
         }
     }
 }
 
-// --- TÂCHE 2 : RADIO LORA (Priorité Haute) ---
+// --- TÂCHE RADIO ---
 void taskLoRa(void *pvParameters) {
-    // Init SPI Standard
     SPI.begin(PIN_LORA_SCK, PIN_LORA_MISO, PIN_LORA_MOSI, PIN_LORA_SS);
     LoRa.setPins(PIN_LORA_SS, PIN_LORA_RST, PIN_LORA_DIO0);
     
     if (!LoRa.begin(LORA_FREQUENCY)) {
-        Serial.println("LoRa Init Failed!");
-        vTaskDelete(NULL); // Suicide de la tâche si échec
+        Serial.println("LoRa Init Failed!"); vTaskDelete(NULL);
     }
     
-    // Config Radio Identique
     LoRa.setSpreadingFactor(LORA_SF);
     LoRa.setSignalBandwidth(LORA_BW);
     LoRa.setCodingRate4(LORA_CR);
     LoRa.setSyncWord(LORA_SYNC_WORD);
-    LoRa.setGain(6); // LNA Boost Max
+    LoRa.setGain(6); 
 
-    Serial.println("LoRa Listening...");
+    Serial.println("LoRa Ready & Listening...");
     unsigned long lastPacketTime = 0;
 
     for (;;) {
-        // Parsing Packet
-        if (LoRa.parsePacket() == 2) { // On attend [ID, CMD]
-            uint8_t id = LoRa.read();
-            uint8_t cmd = LoRa.read();
-            uint8_t ack = 0;
+        if (LoRa.parsePacket()) { 
+            if(LoRa.available() >= 2) {
+                uint8_t id = LoRa.read();
+                uint8_t cmd = LoRa.read();
+                uint8_t ack = 0;
 
-            if (id == DEVICE_ID) {
-                // Anti-Replay simple (1 sec)
-                bool isNew = (millis() - lastPacketTime > 1000);
-                
-                if (cmd == CMD_RELAY_ON) { 
-                    if(isNew) xQueueSend(cmdQueue, &cmd, 0); 
-                    ack = ACK_RELAY_IS_ON; 
-                } 
-                else if (cmd == CMD_RELAY_OFF) { 
-                    if(isNew) xQueueSend(cmdQueue, &cmd, 0); 
-                    ack = ACK_RELAY_IS_OFF; 
-                }
-                else if (cmd == CMD_GET_STATUS) { 
-                    // Lecture état physique pin
-                    ack = digitalRead(PIN_RELAY) ? ACK_RELAY_IS_ON : ACK_RELAY_IS_OFF; 
-                }
-                
-                if(isNew) lastPacketTime = millis();
+                if (id == DEVICE_ID) {
+                    Serial.print("RX CMD: 0x"); Serial.println(cmd, HEX);
+                    
+                    // Anti-Replay sur l'ACTION physique uniquement (1 seconde)
+                    // Mais on enverra l'ACK quoi qu'il arrive !
+                    bool isNewAction = (millis() - lastPacketTime > 1000);
+                    
+                    if (cmd == CMD_RELAY_ON) { 
+                        if(isNewAction) { xQueueSend(cmdQueue, &cmd, 0); lastPacketTime = millis(); }
+                        ack = ACK_RELAY_IS_ON; 
+                    } 
+                    else if (cmd == CMD_RELAY_OFF) { 
+                        if(isNewAction) { xQueueSend(cmdQueue, &cmd, 0); lastPacketTime = millis(); }
+                        ack = ACK_RELAY_IS_OFF; 
+                    }
+                    else if (cmd == CMD_GET_STATUS) { 
+                        ack = isRelayOn ? ACK_RELAY_IS_ON : ACK_RELAY_IS_OFF; 
+                    }
 
-                // Envoi ACK
-                if(ack != 0) {
-                    delay(20); // Laisser l'émetteur passer en RX
-                    LoRa.beginPacket(); 
-                    LoRa.write(DEVICE_ID); 
-                    LoRa.write(ack); 
-                    LoRa.endPacket(); 
-                    LoRa.receive(); // Retour écoute
-                    Serial.printf("ACK Sent: 0x%02X\n", ack);
+                    // ENVOI ACK
+                    if(ack != 0) {
+                        // --- MODIFICATION CRITIQUE ICI ---
+                        // On attend 100ms pour être sûr que la télécommande écoute
+                        vTaskDelay(pdMS_TO_TICKS(100)); 
+                        
+                        LoRa.beginPacket(); 
+                        LoRa.write(DEVICE_ID); 
+                        LoRa.write(ack); 
+                        LoRa.endPacket(); 
+                        LoRa.receive(); // Retour en écoute
+                        Serial.println("-> ACK SENT");
+                    }
                 }
             }
         }
-        vTaskDelay(pdMS_TO_TICKS(10)); // Yield pour éviter Watchdog CPU
+        vTaskDelay(pdMS_TO_TICKS(10)); 
     }
 }
 
 void setup() {
     Serial.begin(115200);
-    
     cmdQueue = xQueueCreate(10, sizeof(uint8_t));
-
-    // Création Tâches FreeRTOS (Core 1 pour Radio, Core 0 pour Relais)
     xTaskCreatePinnedToCore(taskLoRa, "LoRa", 4096, NULL, 5, NULL, 1);
     xTaskCreatePinnedToCore(taskRelay, "Relay", 2048, NULL, 1, NULL, 0);
 }
 
-void loop() { 
-    vTaskDelete(NULL); // Loop Arduino inutile
-}
+void loop() { vTaskDelete(NULL); }
